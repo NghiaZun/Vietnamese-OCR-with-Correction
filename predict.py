@@ -1,15 +1,16 @@
-# predict.py
+# predict.py - Modified to save JSON
 import os
 import sys
 import argparse
 import warnings
 import cv2
+import json
 from PIL import Image
 import torch
 
 from vietocr.vietocr.tool.predictor import Predictor
 from vietocr.vietocr.tool.config import Cfg
-from paddleocr import PaddleOCR  # dùng 'paddleocr' (chữ thường)
+from paddleocr import PaddleOCR
 from transformers import pipeline
 
 warnings.filterwarnings("ignore")
@@ -52,7 +53,8 @@ def build_paddle(device: str,
                  det_db_unclip_ratio: float = 2.0,
                  force_cpu: bool = False) -> PaddleOCR:
     """Khởi tạo PaddleOCR (det-only). Mặc định cho chạy 'dễ ăn' hơn."""
-    use_gpu = (device == "cuda") and (not force_cpu)
+    use_gpu = (device == "cuda") and (not force_cpu) and torch.cuda.is_available()
+    print(f"[INFO] PaddleOCR GPU: {use_gpu}")
     return PaddleOCR(
         use_angle_cls=angle_cls,
         lang="vi",
@@ -62,6 +64,7 @@ def build_paddle(device: str,
         det_limit_side_len=det_limit_side_len,
         det_db_box_thresh=det_db_box_thresh,
         det_db_unclip_ratio=det_db_unclip_ratio,
+        show_log=False  # Giảm log spam
     )
 
 
@@ -80,7 +83,6 @@ def preprocess_for_det(img_bgr, min_long_side: int = 800):
     if long_side < min_long_side:
         scale = max(2, int(min_long_side / max(1, long_side)))
         th = cv2.resize(th, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-    # PaddleOCR nhận array 3 kênh tốt hơn
     th3 = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
     return th3
 
@@ -122,7 +124,7 @@ def predict(recognitor: Predictor,
     boxes = []
     for item in lines:
         try:
-            poly = item[0]  # 4 điểm (x,y)
+            poly = item[0]
             if poly is None:
                 continue
             xs = [pt[0] for pt in poly]
@@ -136,7 +138,6 @@ def predict(recognitor: Predictor,
         except Exception:
             continue
 
-    # Đọc từ dưới lên như bản cũ (có thể bỏ nếu muốn)
     boxes = boxes[::-1]
 
     # Recognize
@@ -157,59 +158,36 @@ def predict(recognitor: Predictor,
     return boxes, texts
 
 
-def save_txt_mirrored(root_img: str, output_root: str, image_path: str, texts, corrections):
-    """
-    Lưu theo cấu trúc cây:
-      output_root/<relative_dir_of_image>/<image_stem>.txt
-    """
-    if os.path.isdir(root_img):
-        rel_dir = os.path.dirname(os.path.relpath(image_path, root_img))
-        out_dir = os.path.join(output_root, rel_dir)
-    else:
-        out_dir = output_root
-
-    os.makedirs(out_dir, exist_ok=True)
-    stem = os.path.splitext(os.path.basename(image_path))[0]
-    out_txt = os.path.join(out_dir, f"{stem}.txt")
-
-    with open(out_txt, "w", encoding="utf-8") as f:
-        for raw, corr in zip(texts, corrections):
-            f.write(f"RAW: {raw}\n")
-            f.write(f"CORR: {corr['generated_text']}\n")
-            f.write("-" * 20 + "\n")
-    print(f"[OK] Saved: {out_txt}")
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--img', required=True,
                         help='Đường dẫn 1 ảnh hoặc thư mục gốc chứa nhiều cấp thư mục ảnh')
-    parser.add_argument('--output', default='./runs/predict',
-                        help='Thư mục gốc lưu .txt kết quả (giữ cấu trúc cây)')
+    parser.add_argument('--output', default='/kaggle/working/results.json',
+                        help='File JSON output (mặc định: /kaggle/working/results.json)')
     parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
                         help='auto (ưu tiên GPU nếu có), cpu, hoặc cuda')
     parser.add_argument('--paddle_cpu', action='store_true',
-                        help='Buộc PaddleOCR chạy CPU (hữu ích khi thiếu wheel GPU).')
+                        help='Buộc PaddleOCR chạy CPU')
     parser.add_argument('--preprocess', action='store_true',
-                        help='Bật tiền xử lý ảnh trước khi detect (tăng tỉ lệ phát hiện).')
-    # Tham số detect tinh chỉnh nhanh
+                        help='Bật tiền xử lý ảnh trước khi detect')
     parser.add_argument('--det_limit_side_len', type=int, default=1536)
     parser.add_argument('--det_db_box_thresh', type=float, default=0.30)
     parser.add_argument('--det_db_unclip_ratio', type=float, default=2.0)
     parser.add_argument('--ocr_version', type=str, default='PP-OCRv4',
                         choices=['PP-OCRv2', 'PP-OCRv3', 'PP-OCRv4'])
-    parser.add_argument('--angle_cls', action='store_true', help='Bật phân lớp góc (xoay).')
+    parser.add_argument('--angle_cls', action='store_true', help='Bật phân lớp góc')
     args = parser.parse_args()
 
-    # Device cho VietOCR (Torch)
+    # Device
     if args.device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"[INFO] Auto-detected device: {device.upper()}")
     else:
         device = args.device
-        print(f"[INFO] Using device: {device.upper()} (CUDA available: {torch.cuda.is_available()})")
+        print(f"[INFO] Using device: {device.upper()}")
 
     # Models
+    print("[INFO] Loading models...")
     recognitor = build_vietocr_predictor(device)
     detector = build_paddle(
         device=device,
@@ -221,6 +199,7 @@ def main():
         force_cpu=args.paddle_cpu
     )
     corrector = pipeline("text2text-generation", model="bmd1905/vietnamese-correction-v2")
+    print("[INFO] Models loaded successfully!")
 
     # Ảnh (đệ quy)
     img_paths = list_images_recursively(args.img)
@@ -228,26 +207,47 @@ def main():
         print(f"[ERROR] Không tìm thấy ảnh trong: {args.img}")
         sys.exit(1)
 
-    print(f"[INFO] Số ảnh: {len(img_paths)}")
-    for p in img_paths:
-        print(f"\n=== {p}")
+    print(f"[INFO] Found {len(img_paths)} images")
+    
+    # JSON result: {image_path: [list_of_texts]}
+    results = {}
+    
+    for i, img_path in enumerate(img_paths, 1):
+        print(f"\n[{i}/{len(img_paths)}] Processing: {os.path.basename(img_path)}")
+        
         boxes, texts = predict(
-            recognitor, detector, p,
+            recognitor, detector, img_path,
             padding=4,
             use_preprocess=args.preprocess
         )
+        
         if not texts:
-            print("[INFO] Bỏ qua (không có text).")
+            print("  → No text detected")
+            results[img_path] = []
             continue
 
+        # Correct texts
+        print(f"  → Found {len(texts)} text regions")
         corrections = corrector(texts, max_new_tokens=MAX_NEW_TOKENS)
-
-        # In nhanh ra console
+        
+        # Store corrected texts
+        corrected_texts = []
         for raw, pred in zip(texts, corrections):
-            print("- " + pred['generated_text'])
+            corrected_text = pred['generated_text'].strip()
+            corrected_texts.append(corrected_text)
+            print(f"    • {corrected_text}")
+        
+        results[img_path] = corrected_texts
 
-        # Lưu theo cấu trúc cây
-        save_txt_mirrored(args.img, args.output, p, texts, corrections)
+    # Save JSON
+    os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
+    
+    with open(args.output, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    
+    print(f"\n[SUCCESS] Results saved to: {args.output}")
+    print(f"[INFO] Processed {len(results)} images")
+    print(f"[INFO] Total texts extracted: {sum(len(texts) for texts in results.values())}")
 
 
 if __name__ == "__main__":
