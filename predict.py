@@ -1,254 +1,216 @@
-# predict.py - Modified to save JSON
+import pandas as pd
+import numpy as np
 import os
+import cv2
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+from matplotlib.pyplot import figure
+from PIL import Image
+import difflib
+import re
+import math
+import json
 import sys
 import argparse
-import warnings
-import cv2
-import json
-from PIL import Image
+from pathlib import Path
+import glob
+
 import torch
 
-from vietocr.vietocr.tool.predictor import Predictor
-from vietocr.vietocr.tool.config import Cfg
-from paddleocr import PaddleOCR
-from transformers import pipeline
+import warnings
 
 warnings.filterwarnings("ignore")
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
-MAX_NEW_TOKENS = 256
+from vietocr.vietocr.tool.predictor import Predictor
+from vietocr.vietocr.tool.config import Cfg
+
+from PaddleOCR import PaddleOCR, draw_ocr
+
+# Specifying output path and font path.
+FONT = './PaddleOCR/doc/fonts/latin.ttf'
+
+from transformers import pipeline
+
+corrector = pipeline("text2text-generation", model="bmd1905/vietnamese-correction-v2")
+
+MAX_LENGTH = 256
 
 
-def is_image_file(path: str) -> bool:
-    return os.path.isfile(path) and (os.path.splitext(path)[1].lower() in VALID_EXTS)
-
-
-def list_images_recursively(root: str):
-    """Quét đệ quy mọi cấp, trả về danh sách ảnh."""
-    if os.path.isfile(root) and is_image_file(root):
-        return [root]
-    paths = []
-    for dirpath, _, filenames in os.walk(root):
-        for fn in filenames:
-            if os.path.splitext(fn)[1].lower() in VALID_EXTS:
-                paths.append(os.path.join(dirpath, fn))
-    return sorted(paths)
-
-
-def build_vietocr_predictor(device: str) -> Predictor:
-    config = Cfg.load_config_from_name('vgg_transformer')
-    config['cnn']['pretrained'] = True
-    config['predictor']['beamsearch'] = True
-    config['device'] = device
-    return Predictor(config)
-
-
-def build_paddle(device: str,
-                 angle_cls: bool = True,
-                 ocr_version: str = "PP-OCRv4",
-                 det_limit_side_len: int = 1536,
-                 det_db_box_thresh: float = 0.30,
-                 det_db_unclip_ratio: float = 2.0,
-                 force_cpu: bool = False) -> PaddleOCR:
-    """Khởi tạo PaddleOCR (det-only). Mặc định cho chạy 'dễ ăn' hơn."""
-    use_gpu = (device == "cuda") and (not force_cpu) and torch.cuda.is_available()
-    print(f"[INFO] PaddleOCR GPU: {use_gpu}")
-    return PaddleOCR(
-        use_angle_cls=angle_cls,
-        lang="vi",
-        use_gpu=use_gpu,
-        det=True, rec=False,
-        ocr_version=ocr_version,
-        det_limit_side_len=det_limit_side_len,
-        det_db_box_thresh=det_db_box_thresh,
-        det_db_unclip_ratio=det_db_unclip_ratio,
-        show_log=False  # Giảm log spam
-    )
-
-
-def preprocess_for_det(img_bgr, min_long_side: int = 800):
-    """Tăng tương phản + phóng to nhẹ cho ảnh khó."""
-    if img_bgr is None:
-        return None
-    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    g = cv2.equalizeHist(g)
-    th = cv2.adaptiveThreshold(
-        g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 35, 11
-    )
-    h, w = th.shape
-    long_side = max(h, w)
-    if long_side < min_long_side:
-        scale = max(2, int(min_long_side / max(1, long_side)))
-        th = cv2.resize(th, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-    th3 = cv2.cvtColor(th, cv2.COLOR_GRAY2BGR)
-    return th3
-
-
-def safe_get_lines(det_out):
-    """Chuẩn hóa output của detector về list các dòng; rỗng nếu không có."""
-    if det_out is None:
-        return []
-    if not isinstance(det_out, list) or len(det_out) == 0:
-        return []
-    first = det_out[0]
-    if first is None or first == []:
-        return []
-    return first
-
-
-def predict(recognitor: Predictor,
-            detector: PaddleOCR,
-            img_path: str,
-            padding: int = 4,
-            use_preprocess: bool = False):
+def predict(recognitor, detector, img_path, padding=4):
     # Load image
     img = cv2.imread(img_path)
-    if img is None:
-        print(f"[WARN] Không đọc được ảnh: {img_path}")
-        return [], []
 
-    # Tiền xử lý (tùy chọn)
-    det_input = preprocess_for_det(img) if use_preprocess else img
+    # Text detection
+    result = detector.ocr(img_path, cls=False, det=True, rec=False)
+    result = result[:][:][0]
 
-    # Detect (an toàn với None)
-    det_out = detector.ocr(det_input, cls=False, det=True, rec=False) or []
-    lines = safe_get_lines(det_out)
-    if not lines:
-        return [], []
-
-    # Lấy bbox từ polygon
-    H, W = img.shape[:2]
+    # Filter Boxes
     boxes = []
-    for item in lines:
-        try:
-            poly = item[0]
-            if poly is None:
-                continue
-            xs = [pt[0] for pt in poly]
-            ys = [pt[1] for pt in poly]
-            x1 = max(0, int(min(xs)) - padding)
-            y1 = max(0, int(min(ys)) - padding)
-            x2 = min(W - 1, int(max(xs)) + padding)
-            y2 = min(H - 1, int(max(ys)) + padding)
-            if x2 > x1 and y2 > y1:
-                boxes.append([[x1, y1], [x2, y2]])
-        except Exception:
-            continue
-
+    for line in result:
+        boxes.append([[int(line[0][0]), int(line[0][1])], [int(line[2][0]), int(line[2][1])]])
     boxes = boxes[::-1]
 
-    # Recognize
+    # Add padding to boxes
+    for box in boxes:
+        box[0][0] = box[0][0] - padding
+        box[0][1] = box[0][1] - padding
+        box[1][0] = box[1][0] + padding
+        box[1][1] = box[1][1] + padding
+
+    # Text recognizion
     texts = []
     for i, box in enumerate(boxes):
         try:
-            (x1, y1), (x2, y2) = box
-            crop = img[y1:y2, x1:x2]
-            if crop.size == 0:
+            # Extract cropped region
+            cropped_image = img[box[0][1]:box[1][1], box[0][0]:box[1][0]]
+            
+            # Check if cropped image has valid dimensions
+            if cropped_image.shape[0] <= 0 or cropped_image.shape[1] <= 0:
+                print(f"Warning: Skipping box {i} with invalid dimensions: {cropped_image.shape}")
                 continue
-            pil_img = Image.fromarray(crop)
-            text = recognitor.predict(pil_img)
+            
+            # Convert to PIL Image
+            cropped_image = Image.fromarray(cropped_image)
+            
+            # Check PIL image dimensions
+            if cropped_image.size[0] <= 0 or cropped_image.size[1] <= 0:
+                print(f"Warning: Skipping box {i} with invalid PIL dimensions: {cropped_image.size}")
+                continue
+
+            rec_result = recognitor.predict(cropped_image)
+            text = rec_result
+
             texts.append(text)
+            print(text)
+            
         except Exception as e:
-            print(f"[WARN] Lỗi box {i} ({os.path.basename(img_path)}): {e}")
+            print(f"Warning: Error processing box {i}: {e}")
             continue
 
     return boxes, texts
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--img', required=True,
-                        help='Đường dẫn 1 ảnh hoặc thư mục gốc chứa nhiều cấp thư mục ảnh')
-    parser.add_argument('--output', default='/kaggle/working/results.json',
-                        help='File JSON output (mặc định: /kaggle/working/results.json)')
-    parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
-                        help='auto (ưu tiên GPU nếu có), cpu, hoặc cuda')
-    parser.add_argument('--paddle_cpu', action='store_true',
-                        help='Buộc PaddleOCR chạy CPU')
-    parser.add_argument('--preprocess', action='store_true',
-                        help='Bật tiền xử lý ảnh trước khi detect')
-    parser.add_argument('--det_limit_side_len', type=int, default=1536)
-    parser.add_argument('--det_db_box_thresh', type=float, default=0.30)
-    parser.add_argument('--det_db_unclip_ratio', type=float, default=2.0)
-    parser.add_argument('--ocr_version', type=str, default='PP-OCRv4',
-                        choices=['PP-OCRv2', 'PP-OCRv3', 'PP-OCRv4'])
-    parser.add_argument('--angle_cls', action='store_true', help='Bật phân lớp góc')
-    args = parser.parse_args()
-
-    # Device
-    if args.device == 'auto':
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"[INFO] Auto-detected device: {device.upper()}")
-    else:
-        device = args.device
-        print(f"[INFO] Using device: {device.upper()}")
-
-    # Models
-    print("[INFO] Loading models...")
-    recognitor = build_vietocr_predictor(device)
-    detector = build_paddle(
-        device=device,
-        angle_cls=args.angle_cls,
-        ocr_version=args.ocr_version,
-        det_limit_side_len=args.det_limit_side_len,
-        det_db_box_thresh=args.det_db_box_thresh,
-        det_db_unclip_ratio=args.det_db_unclip_ratio,
-        force_cpu=args.paddle_cpu
-    )
-    corrector = pipeline("text2text-generation", model="bmd1905/vietnamese-correction-v2")
-    print("[INFO] Models loaded successfully!")
-
-    # Ảnh (đệ quy)
-    img_paths = list_images_recursively(args.img)
-    if not img_paths:
-        print(f"[ERROR] Không tìm thấy ảnh trong: {args.img}")
-        sys.exit(1)
-
-    print(f"[INFO] Found {len(img_paths)} images")
+def process_folder(recognitor, detector, folder_path, output_dir):
+    """Process all images in a folder and save to JSON"""
+    folder_path = Path(folder_path)
+    folder_name = folder_path.name
     
-    # JSON result: {image_path: [list_of_texts]}
+    # Get all image files
+    image_files = []
+    for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
+        image_files.extend(folder_path.glob(ext))
+    
+    if not image_files:
+        print(f"No images found in: {folder_path}")
+        return
+    
+    image_files.sort()
+    print(f"Processing {len(image_files)} images in folder: {folder_name}")
+    
+    # Results dictionary: image_name -> list of texts
     results = {}
     
-    for i, img_path in enumerate(img_paths, 1):
-        print(f"\n[{i}/{len(img_paths)}] Processing: {os.path.basename(img_path)}")
-        
-        boxes, texts = predict(
-            recognitor, detector, img_path,
-            padding=4,
-            use_preprocess=args.preprocess
-        )
-        
-        if not texts:
-            print("  → No text detected")
-            results[img_path] = []
-            continue
-
-        # Correct texts
-        print(f"  → Found {len(texts)} text regions")
-        corrections = corrector(texts, max_new_tokens=MAX_NEW_TOKENS)
-        
-        # Store corrected texts
-        corrected_texts = []
-        for raw, pred in zip(texts, corrections):
-            corrected_text = pred['generated_text'].strip()
-            corrected_texts.append(corrected_text)
-            print(f"    • {corrected_text}")
-        
-        results[img_path] = corrected_texts
-
-    # Save JSON
-    os.makedirs(os.path.dirname(args.output) if os.path.dirname(args.output) else '.', exist_ok=True)
+    for img_path in image_files:
+        try:
+            print(f"Processing: {img_path.name}")
+            boxes, texts = predict(recognitor, detector, str(img_path))
+            
+            # Apply correction
+            if texts:
+                corrections = corrector(texts, max_new_tokens=256)
+                corrected_texts = [pred['generated_text'] for pred in corrections]
+                results[img_path.name] = corrected_texts
+            else:
+                results[img_path.name] = []
+                
+        except Exception as e:
+            print(f"Error processing {img_path}: {e}")
+            results[img_path.name] = []
     
-    with open(args.output, 'w', encoding='utf-8') as f:
+    # Save JSON
+    output_file = Path(output_dir) / f"{folder_name}.json"
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     
-    print(f"\n[SUCCESS] Results saved to: {args.output}")
-    print(f"[INFO] Processed {len(results)} images")
-    print(f"[INFO] Total texts extracted: {sum(len(texts) for texts in results.values())}")
+    print(f"Saved: {output_file}")
 
 
-if __name__ == "__main__":
+def find_image_folders(root_dir):
+    """Find all folders containing images"""
+    root_path = Path(root_dir)
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+    
+    image_folders = []
+    
+    for folder_path in root_path.rglob('*'):
+        if folder_path.is_dir():
+            has_images = any(
+                f.suffix.lower() in image_extensions 
+                for f in folder_path.iterdir() 
+                if f.is_file()
+            )
+            
+            if has_images:
+                image_folders.append(folder_path)
+    
+    return sorted(image_folders)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input_dir', required=True, help='Root directory containing folders with images')
+    parser.add_argument('--output_dir', default='./runs/batch_predict', help='Directory to save JSON files')
+    parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'], 
+                       help='Device to use: auto (detect automatically), cpu, or cuda')
+    args = parser.parse_args()
+
+    # Configure of VietOCR
+    config = Cfg.load_config_from_name('vgg_transformer')
+    # Custom weight
+    # config = Cfg.load_config_from_file('vi00_vi01_transformer.yml')
+    # config['weights'] = './pretrain_ocr/vi00_vi01_transformer.pth'
+
+    config['cnn']['pretrained'] = True
+    config['predictor']['beamsearch'] = True
+    
+    # Device configuration
+    if args.device == 'auto':
+        if torch.cuda.is_available():
+            config['device'] = 'cuda'
+            print("Auto-detected device: CUDA GPU")
+        else:
+            config['device'] = 'cpu'
+            print("Auto-detected device: CPU")
+    else:
+        config['device'] = args.device
+        print(f"Using specified device: {args.device}")
+
+    recognitor = Predictor(config)
+
+    # Config of PaddleOCR
+    detector = PaddleOCR(use_angle_cls=False, lang="vi", use_gpu=(config['device'] == 'cuda'))
+    
+    # Find all folders containing images
+    print(f"Scanning for image folders in: {args.input_dir}")
+    image_folders = find_image_folders(args.input_dir)
+    
+    if not image_folders:
+        print(f"No image folders found in: {args.input_dir}")
+        return
+    
+    print(f"Found {len(image_folders)} folders with images")
+    
+    # Process each folder
+    for i, folder_path in enumerate(image_folders, 1):
+        print(f"\n=== Processing folder {i}/{len(image_folders)}: {folder_path} ===")
+        process_folder(recognitor, detector, folder_path, args.output_dir)
+    
+    print(f"\nBatch processing completed! Results saved in: {args.output_dir}")
+
+
+if __name__ == "__main__":    
     main()
