@@ -128,6 +128,27 @@ def predict(recognitor, detector, img_path, padding=4):
         return []
 
 
+def find_image_folders(root_dir):
+    """Find all folders containing images using recursive search"""
+    root_path = Path(root_dir)
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+    
+    image_folders = []
+    
+    for folder_path in root_path.rglob('*'):
+        if folder_path.is_dir():
+            has_images = any(
+                f.suffix.lower() in image_extensions 
+                for f in folder_path.iterdir() 
+                if f.is_file()
+            )
+            
+            if has_images:
+                image_folders.append(folder_path)
+    
+    return sorted(image_folders)
+
+
 def filter_folders_by_range(folders, filter_range=None, include_pattern=None):
     """Filter folders by range or pattern"""
     if not filter_range and not include_pattern:
@@ -226,17 +247,22 @@ def process_folder(recognitor, detector, folder_path, output_dir, input_root):
     relative_path = folder_path.relative_to(input_root)
     path_parts = list(relative_path.parts)
     
-    # Remove duplicate folder names if they exist
-    if len(path_parts) >= 2 and path_parts[0] == path_parts[1]:
-        path_parts.pop(1)
+    # Handle duplicate folder names in path (like L13/L13/L13_V001)
+    # Remove consecutive duplicate parts
+    cleaned_parts = []
+    for part in path_parts:
+        if not cleaned_parts or part != cleaned_parts[-1]:
+            cleaned_parts.append(part)
     
     # Create output directory structure
-    if len(path_parts) > 1:
-        output_subdir = Path(output_dir) / path_parts[0]
+    if len(cleaned_parts) > 1:
+        # Create nested structure: L13/L13_V001.json
+        output_subdir = Path(output_dir) / cleaned_parts[0]
         output_subdir.mkdir(parents=True, exist_ok=True)
-        output_file = output_subdir / f"{path_parts[-1]}.json"
+        output_file = output_subdir / f"{cleaned_parts[-1]}.json"
     else:
-        output_file = Path(output_dir) / f"{path_parts[-1]}.json"
+        # Single level: L13_V001.json
+        output_file = Path(output_dir) / f"{cleaned_parts[-1]}.json"
     
     # Set current file for emergency saving
     current_output_file = output_file
@@ -356,11 +382,29 @@ def main():
 
     # Find all folders containing images using recursive search
     print(f"Scanning for image folders in: {args.input_dir}")
-    image_folders = find_image_folders(args.input_dir)
+    all_image_folders = find_image_folders(args.input_dir)
     
-    if not image_folders:
+    if not all_image_folders:
         print(f"No image folders found in: {args.input_dir}")
         return
+    
+    # Apply filtering if specified
+    if args.filter_range or args.include_pattern:
+        image_folders = filter_folders_by_range(all_image_folders, args.filter_range, args.include_pattern)
+        print(f"Found {len(all_image_folders)} total folders, filtered to {len(image_folders)} folders")
+        
+        if args.filter_range:
+            print(f"Filter range: {args.filter_range}")
+        if args.include_pattern:
+            print(f"Include pattern: {args.include_pattern}")
+            
+        # Show which folders will be processed
+        print("Folders to process:")
+        for folder in image_folders:
+            print(f"  - {folder.name} ({folder})")
+    else:
+        image_folders = all_image_folders
+        print(f"Found {len(image_folders)} folders with images")
     
     total_folders = len(image_folders)
     
