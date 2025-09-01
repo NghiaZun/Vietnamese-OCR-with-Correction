@@ -266,12 +266,37 @@ def main():
     # Prepare output dir
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Get all folders to process (flat structure: /kaggle/input/l25-keyframes/keyframes/L25_V001/)
+    # Get all folders to process 
+    # Check if input_dir contains subfolders with images, or images directly
     all_folders = []
-    for folder in sorted(os.listdir(args.input_dir)):
-        folder_path = os.path.join(args.input_dir, folder)
-        if os.path.isdir(folder_path):
-            all_folders.append((folder, folder_path))
+    
+    # First check if there are image files directly in input_dir
+    direct_images = [f for f in os.listdir(args.input_dir) 
+                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+    
+    if direct_images:
+        # Images are directly in input_dir
+        folder_name = os.path.basename(args.input_dir)
+        all_folders.append((folder_name, args.input_dir))
+    else:
+        # Scan subfolders for images
+        for folder in sorted(os.listdir(args.input_dir)):
+            folder_path = os.path.join(args.input_dir, folder)
+            if os.path.isdir(folder_path):
+                # Check if this folder has images
+                images_in_folder = [f for f in os.listdir(folder_path) 
+                                  if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+                if images_in_folder:
+                    all_folders.append((folder, folder_path))
+                else:
+                    # Check one level deeper
+                    for subfolder in os.listdir(folder_path):
+                        subfolder_path = os.path.join(folder_path, subfolder)
+                        if os.path.isdir(subfolder_path):
+                            images_in_subfolder = [f for f in os.listdir(subfolder_path) 
+                                                 if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+                            if images_in_subfolder:
+                                all_folders.append((subfolder, subfolder_path))
 
     total_folders = len(all_folders)
     remaining_folders = [f for f in all_folders if f[0] not in processed_folders]
