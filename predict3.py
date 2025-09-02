@@ -134,9 +134,9 @@ def process_folder(recognitor, detector, input_folder, output_folder):
     output_file = os.path.join(output_folder, f"{folder_name}.json")
     current_output_file = output_file
 
-    # Skip if already processed
-    if folder_name in processed_folders:
-        print(f"Skipping {folder_name}, already processed.")
+    # Skip if already processed (using full path)
+    if output_file in processed_folders:
+        print(f"Skipping {output_file}, already processed.")
         return "skipped"
 
     current_results = {}
@@ -155,7 +155,7 @@ def process_folder(recognitor, detector, input_folder, output_folder):
     
     if not image_files:
         print(f"No image files found in {folder_name}")
-        processed_folders.append(folder_name)
+        processed_folders.append(output_file)  # Store full path instead of folder name
         save_progress_log()
         return "empty"
 
@@ -195,7 +195,7 @@ def process_folder(recognitor, detector, input_folder, output_folder):
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(current_results, f, ensure_ascii=False, indent=2)
         print(f"Results saved to {output_file}")
-        processed_folders.append(folder_name)
+        processed_folders.append(output_file)  # Store full path instead of folder name
         save_progress_log()
         return "success"
     except Exception as e:
@@ -277,7 +277,8 @@ def main():
     if direct_images:
         # Images are directly in input_dir
         folder_name = os.path.basename(args.input_dir)
-        all_folders.append((folder_name, args.input_dir))
+        output_file = os.path.join(args.output_dir, f"{folder_name}.json")
+        all_folders.append((folder_name, args.input_dir, output_file))
     else:
         # Scan subfolders for images
         for folder in sorted(os.listdir(args.input_dir)):
@@ -287,7 +288,8 @@ def main():
                 images_in_folder = [f for f in os.listdir(folder_path) 
                                   if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
                 if images_in_folder:
-                    all_folders.append((folder, folder_path))
+                    output_file = os.path.join(args.output_dir, f"{folder}.json")
+                    all_folders.append((folder, folder_path, output_file))
                 else:
                     # Check one level deeper
                     for subfolder in os.listdir(folder_path):
@@ -296,10 +298,11 @@ def main():
                             images_in_subfolder = [f for f in os.listdir(subfolder_path) 
                                                  if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
                             if images_in_subfolder:
-                                all_folders.append((subfolder, subfolder_path))
+                                output_file = os.path.join(args.output_dir, f"{subfolder}.json")
+                                all_folders.append((subfolder, subfolder_path, output_file))
 
     total_folders = len(all_folders)
-    remaining_folders = [f for f in all_folders if f[0] not in processed_folders]
+    remaining_folders = [f for f in all_folders if f[2] not in processed_folders]  # Compare using output file path
     
     print(f"Found {total_folders} total folders")
     print(f"Already processed: {len(processed_folders)} folders")
@@ -314,13 +317,14 @@ def main():
     failed_folders = 0
     empty_folders = 0
     
-    for i, (folder_name, folder_path) in enumerate(all_folders, 1):
-        if folder_name in processed_folders:
+    for i, (folder_name, folder_path, output_file) in enumerate(all_folders, 1):
+        if output_file in processed_folders:
             # Don't process folders that were already processed
             continue
             
-        remaining_count = len([f for f in all_folders[i-1:] if f[0] not in processed_folders])
+        remaining_count = len([f for f in all_folders[i-1:] if f[2] not in processed_folders])
         print(f"\n=== Processing folder {i}/{total_folders}: {folder_name} ===")
+        print(f"Output file will be: {output_file}")
         print(f"Remaining folders: {remaining_count}")
         
         result = process_folder(recognitor, detector, folder_path, args.output_dir)
