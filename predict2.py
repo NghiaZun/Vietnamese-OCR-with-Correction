@@ -27,7 +27,7 @@ current_output_file = None
 processed_folders = []
 
 # Paths for progress log
-resume_file = Path("/kaggle/input/l25-gen/processing_progress.json")
+resume_file = Path("/kaggle/input/l21-l24/processing_progress.json")
 progress_file = Path("/kaggle/working/processing_progress.json")
 
 # Initialize corrector globally to avoid reloading
