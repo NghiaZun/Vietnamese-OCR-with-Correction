@@ -24,11 +24,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Global variables for checkpoint
 current_results = {}
 current_output_file = None
-processed_folders = set()  # Changed to set for O(1) lookups
+processed_folders = set()
 
-# Paths for progress log
-resume_file = Path("/kaggle/input/l25-gen/processing_progress.json")
-progress_file = Path("/kaggle/working/processing_progress.json")
+# Global variables for progress file path
+progress_file = None
 
 # Initialize corrector globally to avoid reloading
 corrector = pipeline("text2text-generation", model="bmd1905/vietnamese-correction-v2")
@@ -53,12 +52,20 @@ def save_current_results():
 
 
 def save_progress_log():
-    """Save progress log into /kaggle/working/"""
+    """Save progress log"""
+    global progress_file
+    if progress_file is None:
+        print("Progress file path not set, cannot save progress")
+        return
+        
     try:
+        # Ensure the directory exists
+        progress_file.parent.mkdir(parents=True, exist_ok=True)
+        
         with open(progress_file, 'w', encoding='utf-8') as f:
             json.dump({
                 "timestamp": datetime.now().isoformat(),
-                "processed_folders": list(processed_folders),  # Convert set to list
+                "processed_folders": list(processed_folders),
                 "current_file": str(current_output_file) if current_output_file else None
             }, f, ensure_ascii=False, indent=2)
         print(f"Progress saved: {len(processed_folders)} folders completed")
@@ -66,13 +73,24 @@ def save_progress_log():
         print(f"Error saving progress: {e}")
 
 
-def load_progress():
+def load_progress(resume_from=None):
     """Load progress from file"""
     global processed_folders
     
     try:
-        # First try to load from working directory
-        if progress_file.exists():
+        # First try to load from specified resume file
+        if resume_from and Path(resume_from).exists():
+            print(f"Loading progress from specified file: {resume_from}")
+            with open(resume_from, 'r', encoding='utf-8') as f:
+                progress = json.load(f)
+                processed_folders = set(progress.get("processed_folders", []))
+                print(f"Loaded {len(processed_folders)} processed folders from specified resume file")
+                # Save to current progress file for future use
+                save_progress_log()
+                return True
+        
+        # Then try to load from current progress file
+        elif progress_file and progress_file.exists():
             print(f"Loading progress from: {progress_file}")
             with open(progress_file, 'r', encoding='utf-8') as f:
                 progress = json.load(f)
@@ -80,14 +98,14 @@ def load_progress():
                 print(f"Loaded {len(processed_folders)} processed folders from progress file")
                 return True
         
-        # If not found, try resume file
-        elif resume_file.exists():
-            print(f"Loading progress from resume file: {resume_file}")
+        # Finally try to load from default resume file (backward compatibility)
+        elif resume_file and resume_file.exists():
+            print(f"Loading progress from default resume file: {resume_file}")
             with open(resume_file, 'r', encoding='utf-8') as f:
                 progress = json.load(f)
                 processed_folders = set(progress.get("processed_folders", []))
-                print(f"Loaded {len(processed_folders)} processed folders from resume file")
-                # Copy to working directory for future use
+                print(f"Loaded {len(processed_folders)} processed folders from default resume file")
+                # Copy to current progress file for future use
                 save_progress_log()
                 return True
                 
@@ -266,12 +284,7 @@ def process_folder(recognitor, detector, input_folder, output_folder):
 
 
 def main():
-    global processed_folders
-    
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-    atexit.register(save_current_results)
+    global processed_folders, progress_file, resume_file
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_dir', required=True, help='Root directory containing folders with images')
@@ -279,15 +292,38 @@ def main():
     parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'], 
                        help='Device to use: auto (detect automatically), cpu, or cuda')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+    parser.add_argument('--resume_file', type=str, help='Specific resume file to load from')
+    parser.add_argument('--progress_dir', type=str, help='Directory to save progress file (default: output_dir)')
     args = parser.parse_args()
 
+    # Set up progress file paths
+    if args.progress_dir:
+        progress_dir = Path(args.progress_dir)
+    else:
+        progress_dir = Path(args.output_dir)
+    
+    progress_file = progress_dir / "processing_progress.json"
+    
+    # Default resume file for backward compatibility
+    resume_file = Path("/kaggle/input/l25-gen/processing_progress.json")
+    
     print("="*60)
     print("🚀 Starting Vietnamese OCR Batch Processing")
     print("="*60)
+    print(f"📁 Input directory: {args.input_dir}")
+    print(f"📁 Output directory: {args.output_dir}")
+    print(f"📄 Progress file: {progress_file}")
+    if args.resume_file:
+        print(f"📄 Resume from: {args.resume_file}")
+
+    # Register signal handlers
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    atexit.register(save_current_results)
 
     # Load progress if resume is requested or if progress file exists
-    if args.resume or progress_file.exists():
-        load_progress()
+    if args.resume or args.resume_file or progress_file.exists():
+        load_progress(args.resume_file)
         initial_processed_count = len(processed_folders)
         print(f"📋 Resume mode: {initial_processed_count} folders already completed")
     else:
@@ -322,6 +358,8 @@ def main():
 
     # Prepare output dir
     os.makedirs(args.output_dir, exist_ok=True)
+    # Prepare progress dir
+    progress_dir.mkdir(parents=True, exist_ok=True)
 
     # Get all folders to process 
     print(f"\n🔍 Scanning input directory: {args.input_dir}")
