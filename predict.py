@@ -24,7 +24,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Global variables for checkpoint
 current_results = {}
 current_output_file = None
-processed_folders = []
+processed_folders = set()  # Changed to set for O(1) lookups
 
 # Paths for progress log
 resume_file = Path("/kaggle/input/l25-gen/processing_progress.json")
@@ -58,11 +58,47 @@ def save_progress_log():
         with open(progress_file, 'w', encoding='utf-8') as f:
             json.dump({
                 "timestamp": datetime.now().isoformat(),
-                "processed_folders": processed_folders,
+                "processed_folders": list(processed_folders),  # Convert set to list
                 "current_file": str(current_output_file) if current_output_file else None
             }, f, ensure_ascii=False, indent=2)
+        print(f"Progress saved: {len(processed_folders)} folders completed")
     except Exception as e:
         print(f"Error saving progress: {e}")
+
+
+def load_progress():
+    """Load progress from file"""
+    global processed_folders
+    
+    try:
+        # First try to load from working directory
+        if progress_file.exists():
+            print(f"Loading progress from: {progress_file}")
+            with open(progress_file, 'r', encoding='utf-8') as f:
+                progress = json.load(f)
+                processed_folders = set(progress.get("processed_folders", []))
+                print(f"Loaded {len(processed_folders)} processed folders from progress file")
+                return True
+        
+        # If not found, try resume file
+        elif resume_file.exists():
+            print(f"Loading progress from resume file: {resume_file}")
+            with open(resume_file, 'r', encoding='utf-8') as f:
+                progress = json.load(f)
+                processed_folders = set(progress.get("processed_folders", []))
+                print(f"Loaded {len(processed_folders)} processed folders from resume file")
+                # Copy to working directory for future use
+                save_progress_log()
+                return True
+                
+    except Exception as e:
+        print(f"Error loading progress: {e}")
+        processed_folders = set()
+        return False
+    
+    print("No progress file found, starting fresh")
+    processed_folders = set()
+    return False
 
 
 def predict(recognitor, detector, img_path, padding=4):
@@ -134,72 +170,98 @@ def process_folder(recognitor, detector, input_folder, output_folder):
     output_file = os.path.join(output_folder, f"{folder_name}.json")
     current_output_file = output_file
 
-    # Skip if already processed
+    # Check if already processed
     if folder_name in processed_folders:
-        print(f"Skipping {folder_name}, already processed.")
+        print(f"✅ Skipping {folder_name} - already processed")
         return "skipped"
 
+    # Check if output file exists (partial completion)
+    file_existed = os.path.exists(output_file)
     current_results = {}
     
-    # Check if file already exists (resume from checkpoint)
-    if os.path.exists(output_file):
+    if file_existed:
         try:
             with open(output_file, 'r', encoding='utf-8') as f:
                 current_results = json.load(f)
-            print(f"Resuming from existing file: {output_file}")
-        except:
+            print(f"📂 Resuming {folder_name} from existing file with {len(current_results)} images")
+        except Exception as e:
+            print(f"⚠️  Error reading existing file {output_file}: {e}")
             current_results = {}
+    else:
+        print(f"🆕 Starting fresh: {folder_name}")
     
+    # Get image files
     image_files = [f for f in sorted(os.listdir(input_folder)) 
                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
     
     if not image_files:
-        print(f"No image files found in {folder_name}")
-        processed_folders.append(folder_name)
+        print(f"📁 No images found in {folder_name}")
+        processed_folders.add(folder_name)
         save_progress_log()
         return "empty"
 
-    print(f"Processing folder {folder_name} with {len(image_files)} images...")
+    total_images = len(image_files)
+    already_processed = len([f for f in image_files if f in current_results])
+    remaining_images = total_images - already_processed
     
+    print(f"📊 Folder {folder_name}: {total_images} total, {already_processed} done, {remaining_images} remaining")
+    
+    if remaining_images == 0:
+        print(f"✅ Folder {folder_name} already completed!")
+        processed_folders.add(folder_name)
+        save_progress_log()
+        return "already_complete"
+    
+    # Process remaining images
+    processed_count = already_processed
     for i, file in enumerate(image_files, 1):
         # Skip if already processed in this session
         if file in current_results:
-            print(f"Skipping already processed: {file}")
             continue
             
         img_path = os.path.join(input_folder, file)
-        print(f"Processing [{i}/{len(image_files)}]: {file}")
+        print(f"🔄 Processing [{processed_count + 1}/{total_images}]: {file}")
         
         try:
             # Use the advanced OCR pipeline
             corrected_texts = predict(recognitor, detector, img_path)
             current_results[file] = corrected_texts
+            processed_count += 1
             
-            # Print recognized text
-            for text in corrected_texts:
-                print(f"  Text: {text}")
+            # Print recognized text (limit output)
+            if corrected_texts:
+                print(f"   📝 Found {len(corrected_texts)} text blocks")
+                for j, text in enumerate(corrected_texts[:3], 1):  # Show max 3 texts
+                    print(f"      {j}. {text[:50]}{'...' if len(text) > 50 else ''}")
+                if len(corrected_texts) > 3:
+                    print(f"      ... and {len(corrected_texts) - 3} more")
+            else:
+                print(f"   📄 No text detected")
             
         except Exception as e:
-            print(f"Error processing {img_path}: {e}")
+            print(f"❌ Error processing {img_path}: {e}")
             current_results[file] = []  # Store empty result for failed images
+            processed_count += 1
 
-        # Save immediately after each image
-        try:
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(current_results, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Error saving intermediate results: {e}")
+        # Save progress every 5 images
+        if processed_count % 5 == 0:
+            try:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(current_results, f, ensure_ascii=False, indent=2)
+                print(f"💾 Intermediate save: {processed_count}/{total_images}")
+            except Exception as e:
+                print(f"⚠️  Error saving intermediate results: {e}")
 
     # Final save for this folder
     try:
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(current_results, f, ensure_ascii=False, indent=2)
-        print(f"Results saved to {output_file}")
-        processed_folders.append(folder_name)
+        print(f"✅ Completed {folder_name}: {output_file}")
+        processed_folders.add(folder_name)
         save_progress_log()
         return "success"
     except Exception as e:
-        print(f"Error saving final results: {e}")
+        print(f"❌ Error saving final results: {e}")
         return "failed"
 
 
@@ -219,26 +281,21 @@ def main():
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
     args = parser.parse_args()
 
-    # Resume logic
-    initial_processed_count = 0
-    if args.resume:
-        if resume_file.exists() and not progress_file.exists():
-            shutil.copy(resume_file, progress_file)
-            print(f"Copied resume file from {resume_file} to {progress_file}")
+    print("="*60)
+    print("🚀 Starting Vietnamese OCR Batch Processing")
+    print("="*60)
 
-        if progress_file.exists():
-            try:
-                with open(progress_file, 'r', encoding='utf-8') as f:
-                    progress = json.load(f)
-                    processed_folders = progress.get("processed_folders", [])
-                initial_processed_count = len(processed_folders)
-                print(f"Resuming: {initial_processed_count} folders already processed")
-            except Exception as e:
-                print(f"Error loading progress log: {e}")
-                processed_folders = []
+    # Load progress if resume is requested or if progress file exists
+    if args.resume or progress_file.exists():
+        load_progress()
+        initial_processed_count = len(processed_folders)
+        print(f"📋 Resume mode: {initial_processed_count} folders already completed")
+    else:
+        initial_processed_count = 0
+        print("🆕 Fresh start mode")
 
     # Configure VietOCR
-    print("Loading VietOCR model...")
+    print("\n🔧 Loading VietOCR model...")
     config = Cfg.load_config_from_name('vgg_transformer')
     config['cnn']['pretrained'] = True
     config['predictor']['beamsearch'] = True
@@ -247,27 +304,27 @@ def main():
     if args.device == 'auto':
         if torch.cuda.is_available():
             config['device'] = 'cuda'
-            print("Auto-detected device: CUDA GPU")
+            print("🎮 Auto-detected device: CUDA GPU")
         else:
             config['device'] = 'cpu'
-            print("Auto-detected device: CPU")
+            print("💻 Auto-detected device: CPU")
     else:
         config['device'] = args.device
-        print(f"Using specified device: {args.device}")
+        print(f"⚙️  Using specified device: {args.device}")
 
     recognitor = Predictor(config)
 
     # Configure PaddleOCR for text detection
-    print("Loading PaddleOCR detector...")
+    print("🔧 Loading PaddleOCR detector...")
     detector = PaddleOCR(use_angle_cls=False, lang="vi", use_gpu=(config['device'] == 'cuda'))
     
-    print("Models loaded successfully!")
+    print("✅ Models loaded successfully!")
 
     # Prepare output dir
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Get all folders to process 
-    # Check if input_dir contains subfolders with images, or images directly
+    print(f"\n🔍 Scanning input directory: {args.input_dir}")
     all_folders = []
     
     # First check if there are image files directly in input_dir
@@ -278,6 +335,7 @@ def main():
         # Images are directly in input_dir
         folder_name = os.path.basename(args.input_dir)
         all_folders.append((folder_name, args.input_dir))
+        print(f"📂 Found {len(direct_images)} images directly in input directory")
     else:
         # Scan subfolders for images
         for folder in sorted(os.listdir(args.input_dir)):
@@ -301,56 +359,76 @@ def main():
     total_folders = len(all_folders)
     remaining_folders = [f for f in all_folders if f[0] not in processed_folders]
     
-    print(f"Found {total_folders} total folders")
-    print(f"Already processed: {len(processed_folders)} folders")
-    print(f"Remaining to process: {len(remaining_folders)} folders")
+    print(f"\n📊 FOLDER SUMMARY:")
+    print(f"   Total folders found: {total_folders}")
+    print(f"   Already processed: {len(processed_folders)}")
+    print(f"   Remaining to process: {len(remaining_folders)}")
+    
+    if processed_folders:
+        print(f"   Previously processed: {', '.join(sorted(list(processed_folders))[:5])}{'...' if len(processed_folders) > 5 else ''}")
     
     if not remaining_folders:
-        print("🎉 All folders have already been processed!")
+        print("🎉 ALL FOLDERS HAVE BEEN PROCESSED!")
         return
+    
+    print(f"\n🎯 Will process {len(remaining_folders)} folders:")
+    for i, (name, _) in enumerate(remaining_folders[:10], 1):
+        print(f"   {i}. {name}")
+    if len(remaining_folders) > 10:
+        print(f"   ... and {len(remaining_folders) - 10} more")
     
     # Process remaining folders
     newly_processed = 0
     failed_folders = 0
     empty_folders = 0
+    skipped_folders = 0
+    
+    print(f"\n🚀 STARTING PROCESSING...")
+    print("="*60)
     
     for i, (folder_name, folder_path) in enumerate(all_folders, 1):
         if folder_name in processed_folders:
-            # Don't process folders that were already processed
             continue
             
         remaining_count = len([f for f in all_folders[i-1:] if f[0] not in processed_folders])
-        print(f"\n=== Processing folder {i}/{total_folders}: {folder_name} ===")
-        print(f"Remaining folders: {remaining_count}")
+        print(f"\n📁 [{i}/{total_folders}] Processing: {folder_name}")
+        print(f"   Remaining after this: {remaining_count - 1}")
         
         result = process_folder(recognitor, detector, folder_path, args.output_dir)
         
         if result == "success":
             newly_processed += 1
-            print(f"✅ Successfully processed {folder_name}")
+            print(f"✅ SUCCESS: {folder_name}")
+        elif result == "already_complete":
+            newly_processed += 1
+            print(f"✅ ALREADY COMPLETE: {folder_name}")
         elif result == "failed":
             failed_folders += 1
-            print(f"❌ Failed to process {folder_name}")
+            print(f"❌ FAILED: {folder_name}")
         elif result == "empty":
             empty_folders += 1
-            print(f"📁 Empty folder: {folder_name}")
+            print(f"📁 EMPTY: {folder_name}")
         elif result == "skipped":
-            # This shouldn't happen since we filter above
-            print(f"⏭️  Unexpectedly skipped: {folder_name}")
+            skipped_folders += 1
+            print(f"⏭️  SKIPPED: {folder_name}")
             
         current_total_processed = len(processed_folders)
-        print(f"Progress: {current_total_processed}/{total_folders} folders completed")
+        progress_pct = (current_total_processed / total_folders) * 100
+        print(f"📈 Overall progress: {current_total_processed}/{total_folders} ({progress_pct:.1f}%)")
 
-    print(f"\n=== PROCESSING SUMMARY ===")
-    print(f"Total folders: {total_folders}")
-    print(f"Previously processed: {initial_processed_count}")
-    print(f"Newly processed this session: {newly_processed}")
-    print(f"Empty folders: {empty_folders}")
-    print(f"Failed: {failed_folders}")
-    print(f"Final total processed: {len(processed_folders)}/{total_folders}")
+    print(f"\n" + "="*60)
+    print(f"🏁 PROCESSING SUMMARY")
+    print(f"="*60)
+    print(f"📊 Total folders: {total_folders}")
+    print(f"📋 Previously processed: {initial_processed_count}")
+    print(f"🆕 Newly processed this session: {newly_processed}")
+    print(f"📁 Empty folders: {empty_folders}")
+    print(f"❌ Failed: {failed_folders}")
+    print(f"⏭️  Skipped: {skipped_folders}")
+    print(f"✅ Final total processed: {len(processed_folders)}/{total_folders}")
     
     if len(processed_folders) == total_folders:
-        print("🎉 ALL FOLDERS COMPLETED!")
+        print("🎉 ALL FOLDERS COMPLETED SUCCESSFULLY!")
     elif failed_folders == 0:
         print("✅ All remaining folders processed successfully!")
     else:
@@ -358,6 +436,8 @@ def main():
         remaining = total_folders - len(processed_folders)
         if remaining > 0:
             print(f"📝 {remaining} folders still need to be processed")
+    
+    print("="*60)
 
 
 if __name__ == '__main__':
