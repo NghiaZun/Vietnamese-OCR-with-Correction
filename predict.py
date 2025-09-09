@@ -171,9 +171,10 @@ def predict_batch(recognitor, detector, img_paths, padding=4, corrector=None, hf
         detections = []
         for p in img_paths:
             try:
-                detections.append(detector.ocr(p, cls=False, det=True, rec=False))
+                det = detector.ocr(p, cls=False, det=True, rec=False)
             except Exception:
-                detections.append([])
+                det = []
+            detections.append(det)
 
 
     # Normalize paddle results: each element corresponds to an image (some versions return [ [boxes], ... ])
