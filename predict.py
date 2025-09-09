@@ -175,6 +175,7 @@ def predict_batch(recognitor, detector, img_paths, padding=4, corrector=None, hf
             except Exception:
                 detections.append([])
 
+
     # Normalize paddle results: each element corresponds to an image (some versions return [ [boxes], ... ])
     # We'll iterate paired
     for idx, img_path in enumerate(img_paths):
@@ -550,4 +551,6 @@ def main():
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.set_start_method("spawn", force=True)
     main()
