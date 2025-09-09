@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# encoding: utf-8
+
 import os
 import sys
 import argparse
@@ -7,10 +10,13 @@ import atexit
 import shutil
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import cv2
 from PIL import Image
 import torch
+
+# Keep imports for original OCR pipeline
 from transformers import pipeline
 from vietocr.vietocr.tool.predictor import Predictor
 from vietocr.vietocr.tool.config import Cfg
@@ -21,27 +27,23 @@ warnings.filterwarnings("ignore")
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Global variables for checkpoint
+# -------------------------
+# Global variables / state
+# -------------------------
 current_results = {}
 current_output_file = None
 processed_folders = set()
-
-# Global variables for progress file path
 progress_file = None
 
-# Initialize corrector globally to avoid reloading
-corrector = pipeline("text2text-generation", model="bmd1905/vietnamese-correction-v2")
+# NOTE: corrector will be initialised in main process (not pickled to workers).
+# For workers we will re-create models inside worker function to avoid pickling issues.
 
 
-def signal_handler(signum, frame):
-    print(f"Received signal {signum}. Saving progress before exit...")
-    save_current_results()
-    save_progress_log()
-    sys.exit(0)
-
-
+# -------------------------
+# Utility: save / load progress
+# -------------------------
 def save_current_results():
-    """Save current results immediately"""
+    """Save current results immediately (used by main process on exit)."""
     if current_results and current_output_file:
         try:
             with open(current_output_file, 'w', encoding='utf-8') as f:
@@ -57,39 +59,34 @@ def save_progress_log():
     if progress_file is None:
         print("Progress file path not set, cannot save progress")
         return
-        
+
     try:
-        # Ensure the directory exists
         progress_file.parent.mkdir(parents=True, exist_ok=True)
-        
         with open(progress_file, 'w', encoding='utf-8') as f:
             json.dump({
                 "timestamp": datetime.now().isoformat(),
-                "processed_folders": list(processed_folders),
-                "current_file": str(current_output_file) if current_output_file else None
+                "processed_folders": sorted(list(processed_folders)),
             }, f, ensure_ascii=False, indent=2)
         print(f"Progress saved: {len(processed_folders)} folders completed")
     except Exception as e:
         print(f"Error saving progress: {e}")
 
 
-def load_progress(resume_from=None):
-    """Load progress from file"""
-    global processed_folders
-    
+def load_progress(resume_from=None, resume_file=None):
+    """Load progress from file (main process only)."""
+    global processed_folders, progress_file
     try:
-        # First try to load from specified resume file
+        # priority: explicit resume_from -> progress_file -> resume_file
         if resume_from and Path(resume_from).exists():
             print(f"Loading progress from specified file: {resume_from}")
             with open(resume_from, 'r', encoding='utf-8') as f:
                 progress = json.load(f)
                 processed_folders = set(progress.get("processed_folders", []))
                 print(f"Loaded {len(processed_folders)} processed folders from specified resume file")
-                # Save to current progress file for future use
+                # propagate to current progress file
                 save_progress_log()
                 return True
-        
-        # Then try to load from current progress file
+
         elif progress_file and progress_file.exists():
             print(f"Loading progress from: {progress_file}")
             with open(progress_file, 'r', encoding='utf-8') as f:
@@ -97,385 +94,459 @@ def load_progress(resume_from=None):
                 processed_folders = set(progress.get("processed_folders", []))
                 print(f"Loaded {len(processed_folders)} processed folders from progress file")
                 return True
-        
-        # Finally try to load from default resume file (backward compatibility)
-        elif resume_file and resume_file.exists():
+
+        elif resume_file and Path(resume_file).exists():
             print(f"Loading progress from default resume file: {resume_file}")
             with open(resume_file, 'r', encoding='utf-8') as f:
                 progress = json.load(f)
                 processed_folders = set(progress.get("processed_folders", []))
                 print(f"Loaded {len(processed_folders)} processed folders from default resume file")
-                # Copy to current progress file for future use
                 save_progress_log()
                 return True
-                
+
     except Exception as e:
         print(f"Error loading progress: {e}")
         processed_folders = set()
         return False
-    
+
     print("No progress file found, starting fresh")
     processed_folders = set()
     return False
 
 
-def predict(recognitor, detector, img_path, padding=4):
-    """VietOCR + PaddleOCR prediction with correction"""
-    # Load image
+# -------------------------
+# The "predict" logic - kept same interface but we add a batch-friendly detector call
+# -------------------------
+def predict_single(recognitor, detector, img_path, padding=4):
+    """Original predict logic for a single image (kept as-is)."""
     img = cv2.imread(img_path)
-    
-    # Text detection using PaddleOCR
     result = detector.ocr(img_path, cls=False, det=True, rec=False)
-    result = result[:][:][0]
-    
-    # Filter Boxes
+    # PaddleOCR returns nested structure; normalize
+    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
+        result = result[0]
     boxes = []
     for line in result:
         boxes.append([[int(line[0][0]), int(line[0][1])], [int(line[2][0]), int(line[2][1])]])
     boxes = boxes[::-1]
-    
-    # Add padding to boxes
     for box in boxes:
         box[0][0] = max(0, box[0][0] - padding)
         box[0][1] = max(0, box[0][1] - padding)
         box[1][0] = min(img.shape[1], box[1][0] + padding)
         box[1][1] = min(img.shape[0], box[1][1] + padding)
-    
-    # Text recognition using VietOCR
+
     texts = []
     for i, box in enumerate(boxes):
         try:
-            # Extract cropped region
             cropped_image = img[box[0][1]:box[1][1], box[0][0]:box[1][0]]
-            
-            # Check if cropped image has valid dimensions
             if cropped_image.shape[0] <= 0 or cropped_image.shape[1] <= 0:
-                print(f"Warning: Skipping box {i} with invalid dimensions: {cropped_image.shape}")
                 continue
-            
-            # Convert to PIL Image
             cropped_image = Image.fromarray(cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB))
-            
-            # Check PIL image dimensions
-            if cropped_image.size[0] <= 0 or cropped_image.size[1] <= 0:
-                print(f"Warning: Skipping box {i} with invalid PIL dimensions: {cropped_image.size}")
-                continue
-
             rec_result = recognitor.predict(cropped_image)
             texts.append(rec_result)
-            
         except Exception as e:
-            print(f"Warning: Error processing box {i}: {e}")
             continue
 
-    # Apply Vietnamese text correction
+    # Attempt correction if pipeline available (recognitor/corrector may be None in workers)
     if texts:
-        try:
-            corrections = corrector(texts, max_new_tokens=256)
-            corrected_texts = [pred['generated_text'] for pred in corrections]
-            return corrected_texts
-        except Exception as e:
-            print(f"Warning: Error in text correction: {e}")
-            return texts
+        return texts
     else:
         return []
 
 
-def process_folder(recognitor, detector, input_folder, output_folder):
-    global current_results, current_output_file
-    
-    folder_name = os.path.basename(input_folder)
+def predict_batch(recognitor, detector, img_paths, padding=4, corrector=None, hf_batch_size=16):
+    """
+    Batch detection using PaddleOCR (detector.ocr can accept list of paths).
+    For each image, do recognition using recognitor (per-crop), then optionally correct via HF pipeline in batch.
+    Returns dict: {img_path: [texts...], ...}
+    """
+    results = {}
+    if not img_paths:
+        return results
+
+    # PaddleOCR supports list of images -> returns list of results
+    try:
+        detections = detector.ocr(img_paths, cls=False, det=True, rec=False)
+    except Exception as e:
+        # fallback: per-image detection
+        detections = []
+        for p in img_paths:
+            try:
+                detections.append(detector.ocr(p, cls=False, det=True, rec=False))
+            except Exception:
+                detections.append([])
+
+    # Normalize paddle results: each element corresponds to an image (some versions return [ [boxes], ... ])
+    # We'll iterate paired
+    for idx, img_path in enumerate(img_paths):
+        det = detections[idx] if idx < len(detections) else []
+        if isinstance(det, list) and len(det) > 0 and isinstance(det[0], list):
+            det = det[0]
+        img = cv2.imread(img_path)
+        boxes = []
+        for line in det:
+            try:
+                boxes.append([[int(line[0][0]), int(line[0][1])], [int(line[2][0]), int(line[2][1])]])
+            except Exception:
+                continue
+        boxes = boxes[::-1]
+        for box in boxes:
+            box[0][0] = max(0, box[0][0] - padding)
+            box[0][1] = max(0, box[0][1] - padding)
+            box[1][0] = min(img.shape[1], box[1][0] + padding)
+            box[1][1] = min(img.shape[0], box[1][1] + padding)
+
+        texts = []
+        for i, box in enumerate(boxes):
+            try:
+                cropped_image = img[box[0][1]:box[1][1], box[0][0]:box[1][0]]
+                if cropped_image.shape[0] <= 0 or cropped_image.shape[1] <= 0:
+                    continue
+                cropped_image = Image.fromarray(cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB))
+                rec_result = recognitor.predict(cropped_image)
+                texts.append(rec_result)
+            except Exception:
+                continue
+
+        results[os.path.basename(img_path)] = texts
+
+    # If provided a HuggingFace correction pipeline, batch-correct across all texts per-image
+    if corrector and results:
+        # collect per-image lists flattened
+        all_texts = []
+        keys = []
+        for k, tlist in results.items():
+            if tlist:
+                all_texts.extend(tlist)
+                keys.extend([k] * len(tlist))
+        if all_texts:
+            try:
+                corrected = corrector(all_texts, batch_size=hf_batch_size, max_new_tokens=256)
+                # corrected is list of dicts with 'generated_text'
+                corrected_texts = [c.get('generated_text', '') for c in corrected]
+                # map back
+                mapped = {}
+                for k in results.keys():
+                    mapped[k] = []
+                idx = 0
+                for txt in corrected_texts:
+                    k = keys[idx]
+                    mapped[k].append(txt)
+                    idx += 1
+                # For images that had no detected texts, keep empty list
+                for k in results.keys():
+                    results[k] = mapped.get(k, [])
+            except Exception:
+                # if correction fails, keep raw texts
+                pass
+
+    return results
+
+
+# -------------------------
+# Folder processing (worker-friendly)
+# -------------------------
+def process_folder_worker(args_tuple):
+    """
+    Worker function executed in separate process.
+    args_tuple: (folder_name, input_folder, output_folder, device, batch_size_images, hf_model_name_or_none)
+    This function will:
+      - load models locally inside the worker
+      - process images in the folder in batches (detection batched)
+      - write output_file {folder_name}.json
+      - return (folder_name, status_string)
+    """
+    folder_name, input_folder, output_folder, device, batch_size_images, hf_model_name = args_tuple
+
+    # Prepare output file path
     output_file = os.path.join(output_folder, f"{folder_name}.json")
-    current_output_file = output_file
 
-    # Check if already processed
-    if folder_name in processed_folders:
-        print(f"✅ Skipping {folder_name} - already processed")
-        return "skipped"
-
-    # Check if output file exists (partial completion)
-    file_existed = os.path.exists(output_file)
-    current_results = {}
-    
-    if file_existed:
+    # If output exists and seems complete (we don't know completeness), we will resume reading it
+    current_results_local = {}
+    if os.path.exists(output_file):
         try:
             with open(output_file, 'r', encoding='utf-8') as f:
-                current_results = json.load(f)
-            print(f"📂 Resuming {folder_name} from existing file with {len(current_results)} images")
-        except Exception as e:
-            print(f"⚠️  Error reading existing file {output_file}: {e}")
-            current_results = {}
-    else:
-        print(f"🆕 Starting fresh: {folder_name}")
-    
-    # Get image files
-    image_files = [f for f in sorted(os.listdir(input_folder)) 
+                current_results_local = json.load(f)
+        except Exception:
+            current_results_local = {}
+
+    # Gather image files (sorted)
+    image_files = [f for f in sorted(os.listdir(input_folder))
                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
-    
+
     if not image_files:
-        print(f"📁 No images found in {folder_name}")
-        processed_folders.add(folder_name)
-        save_progress_log()
-        return "empty"
+        # write empty result and return
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump({}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return (folder_name, "empty")
+
+    # Load models inside worker (so each process has its own Predictor & PaddleOCR)
+    try:
+        config = Cfg.load_config_from_name('vgg_transformer')
+        config['cnn']['pretrained'] = True
+        config['predictor']['beamsearch'] = True
+        config['device'] = device
+        recognitor = Predictor(config)
+    except Exception as e:
+        print(f"[Worker {folder_name}] Error loading VietOCR: {e}")
+        recognitor = None
+
+    try:
+        detector = PaddleOCR(use_angle_cls=False, lang="vi", use_gpu=(device == 'cuda'))
+    except Exception as e:
+        print(f"[Worker {folder_name}] Error loading PaddleOCR: {e}")
+        detector = None
+
+    # Optionally load HF corrector inside worker if name provided
+    corrector_local = None
+    if hf_model_name:
+        try:
+            corrector_local = pipeline("text2text-generation", model=hf_model_name)
+        except Exception as e:
+            corrector_local = None
 
     total_images = len(image_files)
-    already_processed = len([f for f in image_files if f in current_results])
-    remaining_images = total_images - already_processed
-    
-    print(f"📊 Folder {folder_name}: {total_images} total, {already_processed} done, {remaining_images} remaining")
-    
-    if remaining_images == 0:
-        print(f"✅ Folder {folder_name} already completed!")
-        processed_folders.add(folder_name)
-        save_progress_log()
-        return "already_complete"
-    
-    # Process remaining images
-    processed_count = already_processed
-    for i, file in enumerate(image_files, 1):
-        # Skip if already processed in this session
-        if file in current_results:
-            continue
-            
-        img_path = os.path.join(input_folder, file)
-        print(f"🔄 Processing [{processed_count + 1}/{total_images}]: {file}")
-        
-        try:
-            # Use the advanced OCR pipeline
-            corrected_texts = predict(recognitor, detector, img_path)
-            current_results[file] = corrected_texts
-            processed_count += 1
-            
-            # Print recognized text (limit output)
-            if corrected_texts:
-                print(f"   📝 Found {len(corrected_texts)} text blocks")
-                for j, text in enumerate(corrected_texts[:3], 1):  # Show max 3 texts
-                    print(f"      {j}. {text[:50]}{'...' if len(text) > 50 else ''}")
-                if len(corrected_texts) > 3:
-                    print(f"      ... and {len(corrected_texts) - 3} more")
-            else:
-                print(f"   📄 No text detected")
-            
-        except Exception as e:
-            print(f"❌ Error processing {img_path}: {e}")
-            current_results[file] = []  # Store empty result for failed images
-            processed_count += 1
+    processed_count = len([f for f in image_files if f in current_results_local])
+    remaining_images = total_images - processed_count
 
-        # Save progress every 5 images
-        if processed_count % 5 == 0:
+    if remaining_images == 0:
+        return (folder_name, "already_complete")
+
+    # We'll process images in batches
+    def chunked(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
+
+    try:
+        for batch in chunked(image_files, batch_size_images):
+            # skip already processed in this batch
+            to_process = [os.path.join(input_folder, f) for f in batch if f not in current_results_local]
+            if not to_process:
+                continue
+
+            # Run batched detection+recognition
+            batch_results = predict_batch(recognitor, detector, to_process, corrector=corrector_local)
+
+            # Merge to current_results_local
+            for p in to_process:
+                key = os.path.basename(p)
+                current_results_local[key] = batch_results.get(key, [])
+
+            processed_count = len([f for f in image_files if f in current_results_local])
+
+            # Save intermediate (after each batch)
             try:
                 with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(current_results, f, ensure_ascii=False, indent=2)
-                print(f"💾 Intermediate save: {processed_count}/{total_images}")
-            except Exception as e:
-                print(f"⚠️  Error saving intermediate results: {e}")
+                    json.dump(current_results_local, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
-    # Final save for this folder
-    try:
+        # final save
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(current_results, f, ensure_ascii=False, indent=2)
-        print(f"✅ Completed {folder_name}: {output_file}")
-        processed_folders.add(folder_name)
-        save_progress_log()
-        return "success"
+            json.dump(current_results_local, f, ensure_ascii=False, indent=2)
+
+        return (folder_name, "success")
     except Exception as e:
-        print(f"❌ Error saving final results: {e}")
-        return "failed"
+        # on error, attempt to save partial
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(current_results_local, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return (folder_name, f"failed:{e}")
 
 
+# -------------------------
+# Main: orchestrates folder-level parallelism
+# -------------------------
 def main():
-    global processed_folders, progress_file, resume_file
-    
+    global processed_folders, progress_file, current_output_file
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_dir', required=True, help='Root directory containing folders with images')
     parser.add_argument('--output_dir', default='./runs/batch_predict', help='Directory to save JSON files')
-    parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'], 
-                       help='Device to use: auto (detect automatically), cpu, or cuda')
+    parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
+                        help='Device to use: auto (detect automatically), cpu, or cuda')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
     parser.add_argument('--resume_file', type=str, help='Specific resume file to load from')
     parser.add_argument('--progress_dir', type=str, help='Directory to save progress file (default: output_dir)')
+    parser.add_argument('--max_workers', type=int, default=None, help='Max parallel folder workers (default auto)')
+    parser.add_argument('--batch_images', type=int, default=8, help='Number of images to batch per PaddleOCR call')
+    parser.add_argument('--hf_corrector', type=str, default="bmd1905/vietnamese-correction-v2",
+                        help='HF model name for correction (set empty "" to disable in workers)')
     args = parser.parse_args()
 
-    # Set up progress file paths
+    # Determine device
+    if args.device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        device = args.device
+
+    # Prepare progress file path
     if args.progress_dir:
         progress_dir = Path(args.progress_dir)
     else:
         progress_dir = Path(args.output_dir)
-    
-    progress_file = progress_dir / "processing_progress.json"
-    
-    # Default resume file for backward compatibility
-    resume_file = Path("/kaggle/input/l25-gen/processing_progress.json")
-    
-    print("="*60)
-    print("🚀 Starting Vietnamese OCR Batch Processing")
-    print("="*60)
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    progress_file_local = progress_dir / "processing_progress.json"
+    progress_file = progress_file_local
+
+    # default resume file (backward compatibility)
+    resume_file_default = Path("/kaggle/input/l25-gen/processing_progress.json")
+
+    print("=" * 60)
+    print("🚀 Starting Vietnamese OCR Batch Processing (folder-level parallel + batched detection)")
+    print("=" * 60)
     print(f"📁 Input directory: {args.input_dir}")
     print(f"📁 Output directory: {args.output_dir}")
     print(f"📄 Progress file: {progress_file}")
+    print(f"🎮 Device: {device}")
     if args.resume_file:
-        print(f"📄 Resume from: {args.resume_file}")
+        print(f"📄 Resume from provided file: {args.resume_file}")
 
-    # Register signal handlers
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    # Register signal handlers in main process
+    def signal_handler_main(signum, frame):
+        print(f"Received signal {signum}. Saving progress and exiting...")
+        save_current_results()
+        save_progress_log()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, signal_handler_main)
+    signal.signal(signal.SIGINT, signal_handler_main)
     atexit.register(save_current_results)
 
-    # Load progress if resume is requested or if progress file exists
+    # Load progress if requested
+    resume_loaded = False
     if args.resume or args.resume_file or progress_file.exists():
-        load_progress(args.resume_file)
-        initial_processed_count = len(processed_folders)
-        print(f"📋 Resume mode: {initial_processed_count} folders already completed")
+        resume_loaded = load_progress(args.resume_file, resume_file_default)
+        print(f"📋 Resume mode: {len(processed_folders)} folders already completed")
     else:
-        initial_processed_count = 0
+        processed_folders = set()
         print("🆕 Fresh start mode")
-
-    # Configure VietOCR
-    print("\n🔧 Loading VietOCR model...")
-    config = Cfg.load_config_from_name('vgg_transformer')
-    config['cnn']['pretrained'] = True
-    config['predictor']['beamsearch'] = True
-    
-    # Device configuration
-    if args.device == 'auto':
-        if torch.cuda.is_available():
-            config['device'] = 'cuda'
-            print("🎮 Auto-detected device: CUDA GPU")
-        else:
-            config['device'] = 'cpu'
-            print("💻 Auto-detected device: CPU")
-    else:
-        config['device'] = args.device
-        print(f"⚙️  Using specified device: {args.device}")
-
-    recognitor = Predictor(config)
-
-    # Configure PaddleOCR for text detection
-    print("🔧 Loading PaddleOCR detector...")
-    detector = PaddleOCR(use_angle_cls=False, lang="vi", use_gpu=(config['device'] == 'cuda'))
-    
-    print("✅ Models loaded successfully!")
 
     # Prepare output dir
     os.makedirs(args.output_dir, exist_ok=True)
-    # Prepare progress dir
-    progress_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get all folders to process 
-    print(f"\n🔍 Scanning input directory: {args.input_dir}")
+    # Scan input directory for folders to process (supports one-level or two-level structure)
     all_folders = []
-    
-    # First check if there are image files directly in input_dir
-    direct_images = [f for f in os.listdir(args.input_dir) 
-                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
-    
+    direct_images = [f for f in os.listdir(args.input_dir)
+                     if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
     if direct_images:
-        # Images are directly in input_dir
-        folder_name = os.path.basename(args.input_dir)
+        folder_name = os.path.basename(args.input_dir.rstrip("/"))
         all_folders.append((folder_name, args.input_dir))
         print(f"📂 Found {len(direct_images)} images directly in input directory")
     else:
-        # Scan subfolders for images
         for folder in sorted(os.listdir(args.input_dir)):
             folder_path = os.path.join(args.input_dir, folder)
             if os.path.isdir(folder_path):
-                # Check if this folder has images
-                images_in_folder = [f for f in os.listdir(folder_path) 
-                                  if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+                images_in_folder = [f for f in os.listdir(folder_path)
+                                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
                 if images_in_folder:
                     all_folders.append((folder, folder_path))
                 else:
-                    # Check one level deeper
-                    for subfolder in os.listdir(folder_path):
+                    # one level deeper
+                    for subfolder in sorted(os.listdir(folder_path)):
                         subfolder_path = os.path.join(folder_path, subfolder)
                         if os.path.isdir(subfolder_path):
-                            images_in_subfolder = [f for f in os.listdir(subfolder_path) 
-                                                 if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+                            images_in_subfolder = [f for f in os.listdir(subfolder_path)
+                                                   if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
                             if images_in_subfolder:
                                 all_folders.append((subfolder, subfolder_path))
 
     total_folders = len(all_folders)
     remaining_folders = [f for f in all_folders if f[0] not in processed_folders]
-    
+
     print(f"\n📊 FOLDER SUMMARY:")
     print(f"   Total folders found: {total_folders}")
     print(f"   Already processed: {len(processed_folders)}")
     print(f"   Remaining to process: {len(remaining_folders)}")
-    
-    if processed_folders:
-        print(f"   Previously processed: {', '.join(sorted(list(processed_folders))[:5])}{'...' if len(processed_folders) > 5 else ''}")
-    
+
     if not remaining_folders:
         print("🎉 ALL FOLDERS HAVE BEEN PROCESSED!")
         return
-    
-    print(f"\n🎯 Will process {len(remaining_folders)} folders:")
-    for i, (name, _) in enumerate(remaining_folders[:10], 1):
-        print(f"   {i}. {name}")
-    if len(remaining_folders) > 10:
-        print(f"   ... and {len(remaining_folders) - 10} more")
-    
-    # Process remaining folders
+
+    # Decide max_workers
+    if device == 'cuda':
+        # On Kaggle GPU (single GPU), safer to run only 1 worker to avoid multiple processes competing for GPU memory.
+        if args.max_workers is None:
+            max_workers = 1
+        else:
+            max_workers = args.max_workers
+            if max_workers > 1:
+                print("⚠️ Warning: You set >1 workers while device is cuda. This may cause GPU contention.")
+    else:
+        # CPU mode: allow multiple workers
+        if args.max_workers is None:
+            max_workers = min(4, (os.cpu_count() or 2))
+        else:
+            max_workers = args.max_workers
+
+    print(f"\n🔁 Will process folders in parallel with max_workers={max_workers}, batch_images={args.batch_images}")
+
+    # Build worker args
+    worker_args = []
+    for folder_name, folder_path in remaining_folders:
+        worker_args.append((folder_name, folder_path, args.output_dir, device, args.batch_images,
+                             args.hf_corrector if args.hf_corrector else None))
+
+    # Use ProcessPoolExecutor to run folder-level parallelism (each worker loads its own models)
     newly_processed = 0
     failed_folders = 0
     empty_folders = 0
     skipped_folders = 0
-    
-    print(f"\n🚀 STARTING PROCESSING...")
-    print("="*60)
-    
-    for i, (folder_name, folder_path) in enumerate(all_folders, 1):
-        if folder_name in processed_folders:
-            continue
-            
-        remaining_count = len([f for f in all_folders[i-1:] if f[0] not in processed_folders])
-        print(f"\n📁 [{i}/{total_folders}] Processing: {folder_name}")
-        print(f"   Remaining after this: {remaining_count - 1}")
-        
-        result = process_folder(recognitor, detector, folder_path, args.output_dir)
-        
-        if result == "success":
-            newly_processed += 1
-            print(f"✅ SUCCESS: {folder_name}")
-        elif result == "already_complete":
-            newly_processed += 1
-            print(f"✅ ALREADY COMPLETE: {folder_name}")
-        elif result == "failed":
-            failed_folders += 1
-            print(f"❌ FAILED: {folder_name}")
-        elif result == "empty":
-            empty_folders += 1
-            print(f"📁 EMPTY: {folder_name}")
-        elif result == "skipped":
-            skipped_folders += 1
-            print(f"⏭️  SKIPPED: {folder_name}")
-            
-        current_total_processed = len(processed_folders)
-        progress_pct = (current_total_processed / total_folders) * 100
-        print(f"📈 Overall progress: {current_total_processed}/{total_folders} ({progress_pct:.1f}%)")
 
-    print(f"\n" + "="*60)
-    print(f"🏁 PROCESSING SUMMARY")
-    print(f"="*60)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_folder = {executor.submit(process_folder_worker, wa): wa[0] for wa in worker_args}
+        for fut in as_completed(future_to_folder):
+            folder = future_to_folder[fut]
+            try:
+                folder_name, result = fut.result()
+                # update global processed_folders & save progress
+                processed_folders.add(folder_name)
+                save_progress_log()
+
+                if result == "success" or result == "already_complete":
+                    newly_processed += 1
+                    print(f"✅ [{folder_name}] {result}")
+                elif result.startswith("failed"):
+                    failed_folders += 1
+                    print(f"❌ [{folder_name}] {result}")
+                elif result == "empty":
+                    empty_folders += 1
+                    print(f"📁 [{folder_name}] EMPTY")
+                else:
+                    print(f"ℹ️ [{folder_name}] {result}")
+
+            except Exception as e:
+                print(f"❌ Error in worker for {folder}: {e}")
+                failed_folders += 1
+
+            # print quick overall progress
+            current_total_processed = len(processed_folders)
+            progress_pct = (current_total_processed / total_folders) * 100 if total_folders > 0 else 100.0
+            print(f"📈 Overall progress: {current_total_processed}/{total_folders} ({progress_pct:.1f}%)")
+
+    # Final summary
+    print("\n" + "=" * 60)
+    print("🏁 PROCESSING SUMMARY")
+    print("=" * 60)
     print(f"📊 Total folders: {total_folders}")
-    print(f"📋 Previously processed: {initial_processed_count}")
+    print(f"📋 Previously processed: {len(processed_folders) - newly_processed}")
     print(f"🆕 Newly processed this session: {newly_processed}")
     print(f"📁 Empty folders: {empty_folders}")
     print(f"❌ Failed: {failed_folders}")
-    print(f"⏭️  Skipped: {skipped_folders}")
     print(f"✅ Final total processed: {len(processed_folders)}/{total_folders}")
-    
     if len(processed_folders) == total_folders:
         print("🎉 ALL FOLDERS COMPLETED SUCCESSFULLY!")
     elif failed_folders == 0:
         print("✅ All remaining folders processed successfully!")
     else:
-        print(f"⚠️  {failed_folders} folders failed to process")
         remaining = total_folders - len(processed_folders)
         if remaining > 0:
             print(f"📝 {remaining} folders still need to be processed")
-    
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == '__main__':
