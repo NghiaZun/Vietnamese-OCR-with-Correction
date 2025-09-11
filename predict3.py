@@ -216,7 +216,7 @@ def predict(img_path, padding=4):
             return []
         
         # Text detection using PaddleOCR
-        result = detector.ocr(img_path, cls=False, det=True, rec=False)
+        result = detector.ocr(img_path, cls=False, det=False, rec=False)
         if not result or not result[0]:
             return []
             
