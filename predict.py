@@ -32,7 +32,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # -------------------------
 current_results = {}
 current_output_file = None
-processed_folders = set()
+processed_folders = set()  # Will store full paths like "/kaggle/input/dataset-batch-3/L26_a/L26_V001"
 progress_file = None
 
 # NOTE: corrector will be initialised in main process (not pickled to workers).
@@ -54,7 +54,7 @@ def save_current_results():
 
 
 def save_progress_log():
-    """Save progress log"""
+    """Save progress log with full paths"""
     global progress_file
     if progress_file is None:
         print("Progress file path not set, cannot save progress")
@@ -65,7 +65,7 @@ def save_progress_log():
         with open(progress_file, 'w', encoding='utf-8') as f:
             json.dump({
                 "timestamp": datetime.now().isoformat(),
-                "processed_folders": sorted(list(processed_folders)),
+                "processed_folders": sorted(list(processed_folders)),  # Keep full paths
             }, f, ensure_ascii=False, indent=2)
         print(f"Progress saved: {len(processed_folders)} folders completed")
     except Exception as e:
@@ -250,14 +250,17 @@ def predict_batch(recognitor, detector, img_paths, padding=4, corrector=None, hf
 def process_folder_worker(args_tuple):
     """
     Worker function executed in separate process.
-    args_tuple: (folder_name, input_folder, output_folder, device, batch_size_images, hf_model_name_or_none)
+    args_tuple: (folder_full_path, output_folder, device, batch_size_images, hf_model_name_or_none)
     This function will:
       - load models locally inside the worker
       - process images in the folder in batches (detection batched)
       - write output_file {folder_name}.json
-      - return (folder_name, status_string)
+      - return (folder_full_path, status_string)
     """
-    folder_name, input_folder, output_folder, device, batch_size_images, hf_model_name = args_tuple
+    folder_full_path, output_folder, device, batch_size_images, hf_model_name = args_tuple
+    
+    # Extract folder name for output file
+    folder_name = os.path.basename(folder_full_path)
 
     # Prepare output file path
     output_file = os.path.join(output_folder, f"{folder_name}.json")
@@ -272,7 +275,7 @@ def process_folder_worker(args_tuple):
             current_results_local = {}
 
     # Gather image files (sorted)
-    image_files = [f for f in sorted(os.listdir(input_folder))
+    image_files = [f for f in sorted(os.listdir(folder_full_path))
                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
 
     if not image_files:
@@ -282,7 +285,7 @@ def process_folder_worker(args_tuple):
                 json.dump({}, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        return (folder_name, "empty")
+        return (folder_full_path, "empty")
 
     # Load models inside worker (so each process has its own Predictor & PaddleOCR)
     try:
@@ -314,7 +317,7 @@ def process_folder_worker(args_tuple):
     remaining_images = total_images - processed_count
 
     if remaining_images == 0:
-        return (folder_name, "already_complete")
+        return (folder_full_path, "already_complete")
 
     # We'll process images in batches
     def chunked(lst, n):
@@ -324,7 +327,7 @@ def process_folder_worker(args_tuple):
     try:
         for batch in chunked(image_files, batch_size_images):
             # skip already processed in this batch
-            to_process = [os.path.join(input_folder, f) for f in batch if f not in current_results_local]
+            to_process = [os.path.join(folder_full_path, f) for f in batch if f not in current_results_local]
             if not to_process:
                 continue
 
@@ -349,7 +352,7 @@ def process_folder_worker(args_tuple):
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(current_results_local, f, ensure_ascii=False, indent=2)
 
-        return (folder_name, "success")
+        return (folder_full_path, "success")
     except Exception as e:
         # on error, attempt to save partial
         try:
@@ -357,7 +360,7 @@ def process_folder_worker(args_tuple):
                 json.dump(current_results_local, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
-        return (folder_name, f"failed:{e}")
+        return (folder_full_path, f"failed:{e}")
 
 
 # -------------------------
@@ -401,8 +404,8 @@ def main():
     print("=" * 60)
     print("🚀 Starting Vietnamese OCR Batch Processing (folder-level parallel + batched detection)")
     print("=" * 60)
-    print(f"📁 Input directory: {args.input_dir}")
-    print(f"📁 Output directory: {args.output_dir}")
+    print(f"📂 Input directory: {args.input_dir}")
+    print(f"📂 Output directory: {args.output_dir}")
     print(f"📄 Progress file: {progress_file}")
     print(f"🎮 Device: {device}")
     if args.resume_file:
@@ -432,33 +435,43 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Scan input directory for folders to process (supports one-level or two-level structure)
-    all_folders = []
+    all_folders = []  # Will contain (folder_name, full_path) tuples
     direct_images = [f for f in os.listdir(args.input_dir)
                      if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+    
     if direct_images:
+        # Images directly in input directory
         folder_name = os.path.basename(args.input_dir.rstrip("/"))
-        all_folders.append((folder_name, args.input_dir))
+        full_path = os.path.abspath(args.input_dir)
+        all_folders.append((folder_name, full_path))
         print(f"📂 Found {len(direct_images)} images directly in input directory")
     else:
-        for folder in sorted(os.listdir(args.input_dir)):
-            folder_path = os.path.join(args.input_dir, folder)
-            if os.path.isdir(folder_path):
-                images_in_folder = [f for f in os.listdir(folder_path)
+        # Look for subdirectories
+        for item in sorted(os.listdir(args.input_dir)):
+            item_path = os.path.join(args.input_dir, item)
+            if os.path.isdir(item_path):
+                # Check if this directory has images
+                images_in_folder = [f for f in os.listdir(item_path)
                                     if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
                 if images_in_folder:
-                    all_folders.append((folder, folder_path))
+                    # This folder contains images
+                    full_path = os.path.abspath(item_path)
+                    all_folders.append((item, full_path))
                 else:
-                    # one level deeper
-                    for subfolder in sorted(os.listdir(folder_path)):
-                        subfolder_path = os.path.join(folder_path, subfolder)
-                        if os.path.isdir(subfolder_path):
-                            images_in_subfolder = [f for f in os.listdir(subfolder_path)
+                    # Look one level deeper
+                    for subitem in sorted(os.listdir(item_path)):
+                        subitem_path = os.path.join(item_path, subitem)
+                        if os.path.isdir(subitem_path):
+                            images_in_subfolder = [f for f in os.listdir(subitem_path)
                                                    if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
                             if images_in_subfolder:
-                                all_folders.append((subfolder, subfolder_path))
+                                full_path = os.path.abspath(subitem_path)
+                                all_folders.append((subitem, full_path))
 
     total_folders = len(all_folders)
-    remaining_folders = [f for f in all_folders if f[0] not in processed_folders]
+    
+    # Filter out already processed folders using full paths
+    remaining_folders = [f for f in all_folders if f[1] not in processed_folders]
 
     print(f"\n📊 FOLDER SUMMARY:")
     print(f"   Total folders found: {total_folders}")
@@ -485,12 +498,12 @@ def main():
         else:
             max_workers = args.max_workers
 
-    print(f"\n🔁 Will process folders in parallel with max_workers={max_workers}, batch_images={args.batch_images}")
+    print(f"\n🔧 Will process folders in parallel with max_workers={max_workers}, batch_images={args.batch_images}")
 
-    # Build worker args
+    # Build worker args - use full paths
     worker_args = []
-    for folder_name, folder_path in remaining_folders:
-        worker_args.append((folder_name, folder_path, args.output_dir, device, args.batch_images,
+    for folder_name, folder_full_path in remaining_folders:
+        worker_args.append((folder_full_path, args.output_dir, device, args.batch_images,
                              args.hf_corrector if args.hf_corrector else None))
 
     # Use ProcessPoolExecutor to run folder-level parallelism (each worker loads its own models)
@@ -502,27 +515,34 @@ def main():
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         future_to_folder = {executor.submit(process_folder_worker, wa): wa[0] for wa in worker_args}
         for fut in as_completed(future_to_folder):
-            folder = future_to_folder[fut]
+            folder_full_path = future_to_folder[fut]
             try:
-                folder_name, result = fut.result()
-                # update global processed_folders & save progress
-                processed_folders.add(folder_name)
+                returned_path, result = fut.result()
+                
+                # Add the full path to processed_folders (matching the format in progress file)
+                processed_folders.add(returned_path)
                 save_progress_log()
 
-                if result == "success" or result == "already_complete":
+                folder_display_name = os.path.basename(returned_path)
+                
+                if result == "success":
                     newly_processed += 1
-                    print(f"✅ [{folder_name}] {result}")
+                    print(f"✅ [{folder_display_name}] SUCCESS")
+                elif result == "already_complete":
+                    newly_processed += 1
+                    print(f"✅ [{folder_display_name}] ALREADY COMPLETE")
                 elif result.startswith("failed"):
                     failed_folders += 1
-                    print(f"❌ [{folder_name}] {result}")
+                    print(f"❌ [{folder_display_name}] {result}")
                 elif result == "empty":
                     empty_folders += 1
-                    print(f"📁 [{folder_name}] EMPTY")
+                    print(f"📁 [{folder_display_name}] EMPTY")
                 else:
-                    print(f"ℹ️ [{folder_name}] {result}")
+                    print(f"ℹ️ [{folder_display_name}] {result}")
 
             except Exception as e:
-                print(f"❌ Error in worker for {folder}: {e}")
+                folder_display_name = os.path.basename(folder_full_path)
+                print(f"❌ Error in worker for {folder_display_name}: {e}")
                 failed_folders += 1
 
             # print quick overall progress
