@@ -24,7 +24,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Global variables for checkpoint
 current_results = {}
 current_output_file = None
-processed_files = set()  # Use set for O(1) lookups, store output file paths
+processed_files = set()  # Store output file paths that are completed
 
 # Paths for progress log
 resume_file = Path("/kaggle/input/processing/processing_progress.json")
@@ -75,7 +75,25 @@ def save_progress_log():
         print(f"❌ Error saving progress: {e}")
 
 
-def load_progress():
+def convert_old_format_to_new(old_progress, output_dir):
+    """Convert old processed_folders format to new processed_files format"""
+    converted_files = set()
+    
+    if "processed_folders" in old_progress:
+        for folder_path in old_progress["processed_folders"]:
+            # Extract folder name from full path
+            folder_name = os.path.basename(folder_path)
+            # Create corresponding output file path
+            output_file = os.path.join(output_dir, f"{folder_name}.json")
+            
+            # Only add if the output file actually exists
+            if os.path.exists(output_file):
+                converted_files.add(output_file)
+                
+    return converted_files
+
+
+def load_progress(output_dir):
     """Load progress from file"""
     global processed_files
     
@@ -85,16 +103,23 @@ def load_progress():
             print(f"📂 Loading progress from: {progress_file}")
             with open(progress_file, 'r', encoding='utf-8') as f:
                 progress = json.load(f)
-                # Handle both old format (processed_folders) and new format (processed_files)
+                
                 if "processed_files" in progress:
+                    # New format - direct use
                     processed_files = set(progress["processed_files"])
+                    # Verify files still exist
+                    existing_files = set()
+                    for file_path in processed_files:
+                        if os.path.exists(file_path):
+                            existing_files.add(file_path)
+                        else:
+                            print(f"⚠️  Previously processed file no longer exists: {file_path}")
+                    processed_files = existing_files
+                    
                 elif "processed_folders" in progress:
-                    # Convert old format: folder names -> file paths
-                    old_folders = progress["processed_folders"]
-                    print(f"⚠️  Converting old format: {len(old_folders)} folder entries")
-                    processed_files = set()
-                    # We can't reliably convert folder names to file paths without output_dir
-                    # So we'll start fresh but show warning
+                    # Old format - convert
+                    print(f"⚠️  Converting old format from working directory")
+                    processed_files = convert_old_format_to_new(progress, output_dir)
                 else:
                     processed_files = set()
                     
@@ -106,12 +131,23 @@ def load_progress():
             print(f"📂 Loading progress from resume file: {resume_file}")
             with open(resume_file, 'r', encoding='utf-8') as f:
                 progress = json.load(f)
+                
                 if "processed_files" in progress:
+                    # New format
                     processed_files = set(progress["processed_files"])
+                    # Verify files still exist
+                    existing_files = set()
+                    for file_path in processed_files:
+                        if os.path.exists(file_path):
+                            existing_files.add(file_path)
+                        else:
+                            print(f"⚠️  Previously processed file no longer exists: {file_path}")
+                    processed_files = existing_files
+                    
                 elif "processed_folders" in progress:
-                    old_folders = progress["processed_folders"]
-                    print(f"⚠️  Converting old format: {len(old_folders)} folder entries")
-                    processed_files = set()
+                    # Old format - convert
+                    print(f"⚠️  Converting old format from resume file")
+                    processed_files = convert_old_format_to_new(progress, output_dir)
                 else:
                     processed_files = set()
                     
@@ -266,8 +302,15 @@ def process_folder(recognitor, detector, input_folder, output_folder):
     
     if not image_files:
         print(f"📁 No images found in {folder_name}")
+        # Mark as processed even if empty
         processed_files.add(output_file)
         save_progress_log()
+        # Create empty JSON file
+        try:
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump({}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️  Error creating empty file: {e}")
         return "empty"
 
     total_images = len(image_files)
@@ -313,8 +356,8 @@ def process_folder(recognitor, detector, input_folder, output_folder):
             current_results[file] = []  # Store empty result for failed images
             processed_count += 1
 
-        # Save progress every 10 images
-        if processed_count % 10 == 0:
+        # Save progress every 5 images (more frequent saves)
+        if processed_count % 5 == 0:
             try:
                 with open(output_file, 'w', encoding='utf-8') as f:
                     json.dump(current_results, f, ensure_ascii=False, indent=2)
@@ -327,6 +370,7 @@ def process_folder(recognitor, detector, input_folder, output_folder):
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(current_results, f, ensure_ascii=False, indent=2)
         print(f"✅ Completed {folder_name}: saved to {output_file}")
+        # Mark as fully processed
         processed_files.add(output_file)
         save_progress_log()
         return "success"
@@ -361,9 +405,12 @@ def main():
         print(f"❌ Input directory does not exist: {args.input_dir}")
         sys.exit(1)
 
+    # Prepare output dir first (needed for progress loading)
+    os.makedirs(args.output_dir, exist_ok=True)
+
     # Load progress automatically if file exists, or if --resume is specified
     if args.resume or progress_file.exists() or resume_file.exists():
-        load_progress()
+        load_progress(args.output_dir)
         initial_processed_count = len(processed_files)
         print(f"📋 Resume mode: {initial_processed_count} files already completed")
     else:
@@ -399,9 +446,6 @@ def main():
     detector = PaddleOCR(use_angle_cls=False, lang="vi", use_gpu=(config['device'] == 'cuda'))
     
     print("✅ Models loaded successfully!")
-
-    # Prepare output dir
-    os.makedirs(args.output_dir, exist_ok=True)
 
     # Get all folders to process 
     print(f"\n🔍 Scanning input directory: {args.input_dir}")
@@ -459,7 +503,7 @@ def main():
     print(f"   Remaining to process: {len(remaining_folders)}")
     
     if processed_files:
-        processed_names = [os.path.basename(f) for f in processed_files]
+        processed_names = [os.path.basename(f).replace('.json', '') for f in processed_files]
         print(f"   Previously processed: {', '.join(sorted(processed_names)[:5])}{'...' if len(processed_names) > 5 else ''}")
     
     if not remaining_folders:
